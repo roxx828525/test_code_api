@@ -1,5 +1,5 @@
 """
-Face Comparison Module - Optimized standalone version
+Face Comparison Module - Optimized version focused on InsightFace with enhanced preprocessing
 """
 import os
 import numpy as np
@@ -10,8 +10,6 @@ from io import BytesIO
 import time
 import tempfile
 import uuid
-import concurrent.futures
-from pathlib import Path
 
 # Configure logging
 logging.basicConfig(
@@ -26,6 +24,23 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 # Global variables for pre-loaded models
 _insightface_app = None
 
+# Initialize models at module import time
+def initialize_models(preload_all=False):
+    """Initialize face recognition models on startup"""
+    global _insightface_app
+    
+    # Always preload InsightFace as it's our primary model
+    if _insightface_app is None:
+        try:
+            import insightface
+            from insightface.app import FaceAnalysis
+            logger.info("Initializing InsightFace model...")
+            _insightface_app = FaceAnalysis(name='buffalo_l')
+            _insightface_app.prepare(ctx_id=-1, det_size=(640, 640))
+            logger.info("InsightFace model loaded successfully")
+        except ImportError as e:
+            logger.error(f"Failed to import InsightFace: {e}")
+
 def load_insightface():
     """Return pre-loaded InsightFace app or load if not initialized"""
     global _insightface_app
@@ -33,28 +48,14 @@ def load_insightface():
         try:
             import insightface
             from insightface.app import FaceAnalysis
-            logger.info("Loading InsightFace model...")
             _insightface_app = FaceAnalysis(name='buffalo_l')
             _insightface_app.prepare(ctx_id=-1, det_size=(640, 640))
-            logger.info("InsightFace model loaded successfully.")
         except ImportError as e:
             logger.error(f"Failed to import InsightFace: {e}")
             raise
     return _insightface_app
 
-# Initialize models
-def initialize_models():
-    """
-    Initialize all required models. This is the preferred way to 
-    ensure models are warm-loaded and ready before usage.
-    """
-    try:
-        load_insightface()
-        logger.info("Model initialization complete.")
-    except Exception as e:
-        logger.error(f"Error initializing models: {e}")
-
-# Helper functions (include the helper functions from face_comparator.py)
+# Helper functions
 def extract_face_with_margin(image, bbox, margin=0.2):
     """Extract face from image with margin"""
     x1, y1, x2, y2 = map(int, bbox)
@@ -71,14 +72,31 @@ def extract_face_with_margin(image, bbox, margin=0.2):
         face = cv2.cvtColor(face, cv2.COLOR_GRAY2BGR)
     return face
 
-def enhance_image_quality(image):
+def enhance_image_quality(image, lightweight=False):
     """
     Enhance image quality for better face detection
     
     Args:
         image: Input image
+        lightweight: If True, use faster processing suitable for real-time
     """
-    try:
+    # For fast mode, only do minimal processing
+    if lightweight:
+        # Convert to LAB color space
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        
+        # Apply CLAHE to the L channel (much faster than denoising)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        cl = clahe.apply(l)
+        
+        # Merge channels and convert back to BGR
+        enhanced = cv2.cvtColor(cv2.merge((cl, a, b)), cv2.COLOR_LAB2BGR)
+        
+        return enhanced
+    
+    # For full mode, do more thorough processing
+    else:
         # Convert to LAB color space
         lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
@@ -90,31 +108,87 @@ def enhance_image_quality(image):
         # Merge channels and convert back to BGR
         enhanced = cv2.cvtColor(cv2.merge((cl, a, b)), cv2.COLOR_LAB2BGR)
         
-        # Simple sharpening (fast)
-        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
-        enhanced = cv2.filter2D(enhanced, -1, kernel)
-
         # Apply denoising (computationally expensive)
+        # Use a smaller search window and template size to speed up
         try:
             enhanced = cv2.fastNlMeansDenoisingColored(enhanced, None, 7, 7, 5, 15)
         except Exception as e:
             logger.warning(f"Denoising failed: {e}")
-
+        
+        # Apply sharpening
+        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+        enhanced = cv2.filter2D(enhanced, -1, kernel)
+        
         # Adjust gamma based on image brightness
         gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY)
         mean = np.mean(gray)
         gamma = 1.5 if mean < 100 else 0.7 if mean > 150 else 1.0
-
+        
         # Apply gamma correction
         inv_gamma = 1.0 / gamma
         table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
-        enhanced = cv2.LUT(enhanced, table)
+        return cv2.LUT(enhanced, table)
 
-        return enhanced
+def calculate_image_quality(image, fast_mode=False):
+    """
+    Calculate image quality score
+    
+    Args:
+        image: Input image
+        fast_mode: If True, use a simplified quality assessment
+    """
+    try:
+        # Convert to grayscale if needed
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image
         
+        # Fast mode only calculates basic metrics
+        if fast_mode:
+            # Calculate sharpness (Laplacian variance) - essential for face recognition
+            sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+            sharpness_score = min(1.0, sharpness / 500)
+            
+            # Calculate brightness
+            brightness = np.mean(gray) / 255
+            brightness_score = 1.0 - 2.0 * abs(0.5 - brightness)
+            
+            # Calculate final quality score (simplified)
+            quality_score = (0.7 * sharpness_score + 0.3 * brightness_score)
+            
+            return min(1.0, max(0.0, quality_score))
+        
+        # Full mode calculates all metrics
+        else:
+            # Calculate sharpness (Laplacian variance)
+            sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+            sharpness_score = min(1.0, sharpness / 500)
+            
+            # Calculate brightness
+            brightness = np.mean(gray) / 255
+            brightness_score = 1.0 - 2.0 * abs(0.5 - brightness)
+            
+            # Calculate contrast
+            contrast = gray.std()
+            contrast_score = min(1.0, contrast / 80)
+            
+            # Calculate noise estimate using median filtering
+            median_filtered = cv2.medianBlur(gray, 3)
+            noise = np.mean(np.abs(gray.astype(np.float32) - median_filtered.astype(np.float32)))
+            noise_score = max(0.0, 1.0 - (noise / 10))
+            
+            # Calculate final quality score
+            quality_score = (0.4 * sharpness_score + 
+                           0.3 * brightness_score + 
+                           0.2 * contrast_score + 
+                           0.1 * noise_score)
+            
+            return min(1.0, max(0.0, quality_score))
+            
     except Exception as e:
-        logger.error(f"Error enhancing image: {e}")
-        return image  # Return original image if enhancement fails
+        logger.error(f"Error calculating image quality: {e}")
+        return 0.5  # Return middle value on error
 
 def correct_face_tilt(face_img):
     """
@@ -236,20 +310,65 @@ def enhance_dark_complexion(face_img):
         
         # Apply gamma correction
         lookup_table = np.array([((i / 255.0) ** (1.0 / gamma)) * 255
-                           for i in np.arange(0, 256)]).astype("uint8")
+                              for i in np.arange(0, 256)]).astype("uint8")
         return cv2.LUT(face_img, lookup_table)
     
     except Exception as e:
         logger.warning(f"Dark complexion enhancement failed: {e}")
         return face_img  # Return original if enhancement fails
 
-def calculate_confidence_score(selfie_score, group_score, match_strength, face_count=1):
+def preprocess_face(face_img, advanced=False):
+    """
+    Unified preprocessing function that applies appropriate enhancements
+    
+    Args:
+        face_img: Input face image
+        advanced: Whether to use advanced preprocessing
+        
+    Returns:
+        Preprocessed face image
+    """
+    # Basic quality enhancement
+    enhanced = enhance_image_quality(face_img, lightweight=not advanced)
+    
+    # Additional processing for advanced mode
+    if advanced:
+        # Correct face tilt
+        enhanced = correct_face_tilt(enhanced)
+        
+        # Enhance dark complexion (if needed)
+        enhanced = enhance_dark_complexion(enhanced)
+    
+    return enhanced
+
+def score_generator(image, fast_mode=False):
+    """
+    Generate image quality score from an image array.
+    Args:
+        image: Input image as a numpy array (BGR format)
+        fast_mode: If True, use simplified quality assessment
+    Returns:
+        Quality score (0-100 scale, float)
+    """
+    try:
+        if image is None or not isinstance(image, np.ndarray):
+            logger.error("Input image is invalid or None.")
+            return 50.0  # Return a middle value
+
+        # Calculate quality score
+        quality_score = calculate_image_quality(image, fast_mode)
+        return round(quality_score * 100, 2)
+    except Exception as e:
+        logger.error(f"Error generating score: {e}")
+        return 50.0  # Return a middle value
+
+def calculate_confidence_score(selfie_quality, group_quality, match_strength, face_count=1):
     """
     Calculate confidence score based on image quality and match strength
     """
     # Base quality factors
-    selfie_factor = selfie_score / 100
-    group_factor = group_score / 100
+    selfie_factor = selfie_quality / 100
+    group_factor = group_quality / 100
     
     # Enhanced match normalization with aggressive boost for matches
     if match_strength >= 50:
@@ -299,7 +418,9 @@ def calculate_confidence_score(selfie_score, group_score, match_strength, face_c
     return round(confidence_percent, 1)
 
 def recalibrate_match_score(original_score, confidence_score):
-    """Recalibrates match scores with natural variation"""
+    """
+    Recalibrates match scores with natural variation
+    """
     MIN_THRESHOLD = 50
     MAX_THRESHOLD = 75
     
@@ -337,105 +458,53 @@ def recalibrate_match_score(original_score, confidence_score):
     
     return round(final_score, 1)  # Round to 1 decimal for clean display
 
-# Simplified score generator
-def score_generator(image):
-    """Generate image quality score"""
-    try:
-        # Calculate brightness
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        brightness = np.mean(gray) / 255
-        
-        # Calculate sharpness
-        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
-        sharpness = laplacian.var()
-        sharpness_score = min(1.0, sharpness / 500)
-        
-        # Calculate quality score
-        quality_score = (0.6 * sharpness_score + 0.4 * (1.0 - 2.0 * abs(0.5 - brightness)))
-            
-        # Scale to 0-100
-        return round(quality_score * 100, 1)
-    except Exception as e:
-        logger.error(f"Error generating score: {e}")
-        return 50.0  # Return a middle value
-
-def compare_faces(selfie_path, reference_path):
+def compare_faces(selfie_path, group_photo_path, basic_mode=False):
     """
-    Compare faces in two images
+    Optimized function to compare faces in two images
     
     Args:
         selfie_path: Path to the selfie image
-        reference_path: Path to the reference image
+        group_photo_path: Path to the group photo
+        basic_mode: If True, uses minimal preprocessing but still checks for face tilt
     """
-    logger.info(f"DIAGNOSTIC RUN: Starting face comparison for {selfie_path} and {reference_path}")
-    logger.info(f"DIAGNOSTIC: Images being compared: selfie={selfie_path}, reference={reference_path}")
+    logger.info(f"Starting face comparison for {selfie_path} and {group_photo_path}")
     start_time = time.time()
     
     try:
-        # Load images using PIL for consistent results (same as original working code)
+        # Load images
         selfie_image = Image.open(selfie_path)
-        reference_image = Image.open(reference_path)
+        group_image = Image.open(group_photo_path)
         
         # Convert to numpy arrays
         selfie = np.array(selfie_image)
-        reference = np.array(reference_image)
+        group_photo = np.array(group_image)
         
-        if selfie is None or reference is None:
+        if selfie is None or group_photo is None:
             raise ValueError("Failed to load one or both images")
-        
-        # Apply image enhancement to improve face detection and matching
-        #logger.info("Enhancing image quality for better face detection and matching")
-        #enhancement_start = time.time()
-        #selfie = enhance_image_quality(selfie)
-        #reference = enhance_image_quality(reference)
-        #enhancement_time = time.time() - enhancement_start
-        #logger.info(f"Image enhancement completed in {enhancement_time:.3f}s")
 
-        # Apply tilt correction
-        selfie = correct_face_tilt(selfie)
-        reference = correct_face_tilt(reference)
-        logger.info("Tilt correction applied to both images.")
-            
+        # Calculate image quality scores
+        logger.info("Calculating image quality scores")
+        selfie_score = score_generator(selfie, fast_mode=basic_mode)
+        group_score = score_generator(group_photo, fast_mode=basic_mode)
+        
         # Convert BGR to RGB for InsightFace
         selfie_rgb = cv2.cvtColor(selfie, cv2.COLOR_BGR2RGB)
-        reference_rgb = cv2.cvtColor(reference, cv2.COLOR_BGR2RGB)
+        group_photo_rgb = cv2.cvtColor(group_photo, cv2.COLOR_BGR2RGB)
+        
+        # Enhance images - use lightweight enhancement in basic mode
+        #group_photo_enhanced = enhance_image_quality(group_photo, lightweight=basic_mode)
         
         # Get InsightFace app
         insightface_app = load_insightface()
         
-        # Completely sequential processing for maximum reliability
-        logger.info("Using sequential processing for maximum accuracy")
-        try:
-            # Face detection - one at a time
-            logger.info("Detecting faces in selfie...")
-            selfie_faces = insightface_app.get(selfie_rgb)
-            logger.info(f"Found {len(selfie_faces)} faces in selfie image")
-            
-            logger.info("Detecting faces in reference image...")
-            reference_faces = insightface_app.get(reference_rgb)
-            logger.info(f"Found {len(reference_faces)} faces in reference image")
-            
-            # Quality assessment - one at a time
-            logger.info("Calculating selfie image quality...")
-            selfie_score = score_generator(selfie)
-            logger.info(f"Selfie quality score: {selfie_score}")
-            
-            logger.info("Calculating reference image quality...")
-            reference_score = score_generator(reference)
-            logger.info(f"Reference quality score: {reference_score}")
-            
-            logger.info("Sequential processing completed successfully")
-        except Exception as e:
-            # Log the error with sequential processing
-            logger.error(f"Error during sequential processing: {e}")
-            raise  # Re-raise the exception to be caught by the outer try-except
-
-        # Check if faces were detected in selfie
+        # Detect faces in selfie
+        logger.info("Detecting faces in selfie")
+        selfie_faces = insightface_app.get(selfie_rgb)
         if len(selfie_faces) == 0:
             logger.warning("No face detected in selfie")
             return [{
                 'face_match_percentage': 0,
-                'confidence': round((selfie_score + reference_score) / 2, 2),
+                'confidence': round((selfie_score + group_score) / 2, 2),
                 'error': 'No face detected in selfie'
             }]
         
@@ -464,10 +533,12 @@ def compare_faces(selfie_path, reference_path):
         else:
             selfie_face = selfie_faces[0]
         
+        selfie_embedding = selfie_face.embedding
+        
         # Extract selfie face for potential tilt correction
         selfie_face_img = extract_face_with_margin(selfie, selfie_face.bbox)
         
-        # Enable tilt correction (even though it's disabled in the main pipeline)
+        # Apply tilt correction to selfie in both modes
         corrected_selfie_face = correct_face_tilt(selfie_face_img)
         
         # Re-run face detection on corrected selfie if it was changed
@@ -481,142 +552,98 @@ def compare_faces(selfie_path, reference_path):
             if len(corrected_faces) > 0:
                 selfie_embedding = corrected_faces[0].embedding
                 logger.info("Using tilt-corrected selfie face for comparison")
-            else:
-                selfie_embedding = selfie_face.embedding
-        else:
-            selfie_embedding = selfie_face.embedding
         
-        if len(reference_faces) == 0:
-            logger.warning("No faces detected in reference image")
+        # Detect faces in group photo
+        logger.info("Detecting faces in group photo")
+        group_faces = insightface_app.get(group_photo_rgb)
+        
+        if len(group_faces) == 0:
+            logger.warning("No faces detected in group photo")
             return [{
                 'face_match_percentage': 0,
-                'confidence': round((selfie_score + reference_score) / 2, 2),
-                'error': 'No face detected in reference image'
+                'confidence': round((selfie_score + group_score) / 2, 2),
+                'error': 'No face detected in group photo'
             }]
-            
-        logger.info(f"DIAGNOSTIC: Found {len(reference_faces)} faces in reference image")
-        for i, face in enumerate(reference_faces):
-            if hasattr(face, 'bbox') and face.bbox is not None:
-                logger.info(f"DIAGNOSTIC: Reference face {i+1} bbox: {face.bbox}")
-            else:
-                logger.info(f"DIAGNOSTIC: Reference face {i+1} has no bbox")
         
-        # Log selfie face details
-        logger.info(f"DIAGNOSTIC: Selfie embedding shape: {selfie_embedding.shape if hasattr(selfie_embedding, 'shape') else 'unknown'}")
-        logger.info(f"DIAGNOSTIC: Selfie embedding norm: {np.linalg.norm(selfie_embedding) if hasattr(selfie_embedding, 'shape') else 'unknown'}")
-        
-        # Helper function for calculating similarity (used for parallel processing)
-        def calculate_face_similarity(ref_face, face_idx, selfie_emb):
-            try:
-                # Calculate similarity using normalized vectors 
-                ref_embedding = ref_face.embedding
-                
-                # Force normalization to unit vectors for consistent results
-                selfie_emb_norm = selfie_emb / np.linalg.norm(selfie_emb)
-                ref_embedding_norm = ref_embedding / np.linalg.norm(ref_embedding)
-                
-                # Compute dot product of normalized vectors (precise cosine similarity) 
-                cosine_similarity = np.dot(selfie_emb_norm, ref_embedding_norm)
-                
-                # Convert to percentage
-                similarity_percent = min(100, max(0, cosine_similarity * 100))
-                
-                logger.debug(f"Raw similarity for face {face_idx}: {similarity_percent:.2f}%")
-                
-                return {
-                    'model': 'InsightFace',
-                    'similarity': similarity_percent,
-                    'weight': 1.0,
-                    'face_id': face_idx,
-                    'index': face_idx  # Keep track of original index
-                }
-            except Exception as e:
-                logger.error(f"Error calculating similarity for face {face_idx}: {e}")
-                return {
-                    'model': 'InsightFace',
-                    'similarity': 0,
-                    'weight': 1.0,
-                    'face_id': face_idx,
-                    'index': face_idx,
-                    'error': str(e)
-                }
-
-        # Use sequential processing for consistent, reliable results
-        logger.info(f"Calculating similarity for {len(reference_faces)} reference faces (sequential)")
-        similarity_results = []
-        
-        # Process each face sequentially
-        for i, face in enumerate(reference_faces):
-            logger.info(f"DIAGNOSTIC: Processing reference face {i+1}")
-            ref_embedding = face.embedding
-            logger.info(f"DIAGNOSTIC: Reference face {i+1} embedding shape: {ref_embedding.shape if hasattr(ref_embedding, 'shape') else 'unknown'}")
-            logger.info(f"DIAGNOSTIC: Reference face {i+1} embedding norm: {np.linalg.norm(ref_embedding) if hasattr(ref_embedding, 'shape') else 'unknown'}")
-            
-            # Direct calculation (as in original code) for consistent results
-            # Calculate similarity directly in the main flow for maximum consistency
-            cosine_similarity = np.dot(selfie_embedding, ref_embedding) / (
-                np.linalg.norm(selfie_embedding) * np.linalg.norm(ref_embedding))
-            similarity_percent = min(100, max(0, cosine_similarity * 100))
-            logger.info(f"DIAGNOSTIC: Raw similarity calculation for face {i+1}: {similarity_percent:.3f}%")
-            
-            # Create a result structure similar to what the function would return
-            result = {
-                'model': 'InsightFace',
-                'similarity': similarity_percent,
-                'weight': 1.0,
-                'face_id': i,
-                'index': i
-            }
-            similarity_results.append(result)
-            logger.info(f"Face {i+1} InsightFace similarity: {result['similarity']:.2f}%")
-        
-        # Find the best match
+        # Find the best matching face
         best_match = None
         best_score = 0
         best_face_index = -1
-        
-        # Find best matching face from results
-        for result in similarity_results:
-            if result['similarity'] > best_score:
-                best_score = result['similarity']
-                best_face_index = result['index']
-                best_match = result
+        best_face_img = None
+
+        # Process all faces with InsightFace
+        for i, face in enumerate(group_faces):
+            # Extract and possibly correct face tilt in group photo
+            group_face_img = extract_face_with_margin(group_photo, face.bbox.astype(int))
+            
+            # Apply tilt correction in both modes
+            corrected_group_face = correct_face_tilt(group_face_img)
+            
+            # Re-detect face in corrected image if needed
+            face_embedding = face.embedding
+            if not np.array_equal(group_face_img, corrected_group_face):
+                logger.info(f"Applying tilt correction to group face {i+1}")
+                corrected_group_rgb = cv2.cvtColor(corrected_group_face, cv2.COLOR_BGR2RGB)
+                corrected_group_faces = insightface_app.get(corrected_group_rgb)
+                if len(corrected_group_faces) > 0:
+                    face_embedding = corrected_group_faces[0].embedding
+                    logger.info(f"Using tilt-corrected group face {i+1} for comparison")
+            
+            # Calculate similarity
+            cosine_similarity = np.dot(selfie_embedding, face_embedding) / (
+                np.linalg.norm(selfie_embedding) * np.linalg.norm(face_embedding))
+            similarity_percent = min(100, max(0, cosine_similarity * 100))
+            
+            if len(group_faces) < 5:
+                logger.info(f"Face {i+1} InsightFace similarity: {similarity_percent:.2f}%")
+            
+            # Track the best match
+            if similarity_percent > best_score:
+                best_score = similarity_percent
+                best_face_index = i
+                # Store the face image for potential advanced processing
+                if not basic_mode and similarity_percent < 50:
+                    best_face_img = corrected_group_face  # Use the tilt-corrected version
+                best_match = {
+                    'model': 'InsightFace',
+                    'similarity': similarity_percent,
+                    'weight': 1.0,
+                    'face_id': i
+                }
         
         # If we have a match
         if best_score > 0:
-            # Store the face image for potential advanced processing
-            best_face_img = None
-            if best_score < 50:
-                # Extract face for enhancement
-                best_face_img = extract_face_with_margin(reference, reference_faces[best_face_index].bbox)
-                
-                # Try dark complexion enhancement for low-scoring faces
-                if best_face_img is not None:
-                    enhanced_face = enhance_dark_complexion(best_face_img)
-                    
-                    # Re-detect face in enhanced image
-                    enhanced_rgb = cv2.cvtColor(enhanced_face, cv2.COLOR_BGR2RGB)
-                    enhanced_faces = insightface_app.get(enhanced_rgb)
-                    
-                    # Update score if improved
-                    if len(enhanced_faces) > 0:
-                        advanced_embedding = enhanced_faces[0].embedding
-                        advanced_similarity = np.dot(selfie_embedding, advanced_embedding) / (
-                            np.linalg.norm(selfie_embedding) * np.linalg.norm(advanced_embedding))
-                        advanced_score = min(100, max(0, advanced_similarity * 100))
-                        
-                        # Use advanced score if it's better
-                        if advanced_score > best_score:
-                            logger.info(f"Advanced preprocessing improved score from {best_score:.2f}% to {advanced_score:.2f}%")
-                            best_score = advanced_score
-            
             # Calculate confidence score
             confidence = calculate_confidence_score(
                 selfie_score,
-                reference_score,
+                group_score,
                 best_score,
-                len(reference_faces)
+                len(group_faces)
             )
+
+            # Apply additional advanced processing if needed (for non-basic mode)
+            if not basic_mode and best_score < 50 and best_face_img is not None:
+                # Apply advanced dark complexion enhancement
+                enhanced_face = enhance_dark_complexion(best_face_img)
+                
+                # Re-detect face in enhanced image
+                enhanced_rgb = cv2.cvtColor(enhanced_face, cv2.COLOR_BGR2RGB)
+                enhanced_faces = insightface_app.get(enhanced_rgb)
+                
+                # Update score if improved
+                if len(enhanced_faces) > 0:
+                    advanced_embedding = enhanced_faces[0].embedding
+                    advanced_similarity = np.dot(selfie_embedding, advanced_embedding) / (
+                        np.linalg.norm(selfie_embedding) * np.linalg.norm(advanced_embedding))
+                    advanced_score = min(100, max(0, advanced_similarity * 100))
+                    
+                    # Use advanced score if it's better
+                    if advanced_score > best_score:
+                        logger.info(f"Advanced preprocessing improved score from {best_score:.2f}% to {advanced_score:.2f}%")
+                        best_score = advanced_score
+                        # Recalculate confidence with new score
+                        confidence = calculate_confidence_score(
+                            selfie_score, group_score, best_score, len(group_faces))
 
             # Recalibrate the score for better presentation
             original_score = best_score
@@ -628,10 +655,10 @@ def compare_faces(selfie_path, reference_path):
                 'face_match_percentage': recalibrated_score,
                 'confidence': confidence,
                 'selfie_quality': selfie_score,
-                'reference_quality': reference_score,
+                'reference_quality': group_score,
                 'faces_detected': {
                     'selfie': len(selfie_faces),
-                    'reference': len(reference_faces)
+                    'reference': len(group_faces)
                 }
             }]
         else:
@@ -639,7 +666,7 @@ def compare_faces(selfie_path, reference_path):
             elapsed_time = time.time() - start_time
             return [{
                 'face_match_percentage': 0,
-                'confidence': round((selfie_score + reference_score) / 2, 2),
+                'confidence': round((selfie_score + group_score) / 2, 2),
                 'error': 'No matching face found',
                 'processing_time': round(elapsed_time, 2)
             }]
@@ -656,3 +683,20 @@ def compare_faces(selfie_path, reference_path):
     finally:
         elapsed_time = time.time() - start_time
         logger.info(f"Face comparison completed in {elapsed_time:.2f} seconds")
+        
+if __name__ == "__main__":
+    # Initialize InsightFace model at startup
+    initialize_models(preload_all=False)
+    
+    # Test the module
+    import sys
+    if len(sys.argv) >= 3:
+        # Check if basic_mode is specified
+        basic_mode = False
+        if len(sys.argv) > 3 and sys.argv[3].lower() == 'true':
+            basic_mode = True
+            
+        result = compare_faces(sys.argv[1], sys.argv[2], basic_mode)
+        print(result)
+    else:
+        print("Usage: python face_comparator.py <selfie_path> <group_photo_path> [basic_mode]")
